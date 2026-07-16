@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import os
 import secrets
-import sqlite3
 from datetime import datetime, timezone
 from functools import wraps
-from pathlib import Path
 
+import psycopg
 from flask import Flask, abort, flash, g, redirect, render_template_string, request, session, url_for
 from markupsafe import Markup
+from psycopg.rows import dict_row
 from werkzeug.security import check_password_hash, generate_password_hash
 
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE = BASE_DIR / "jetdeal.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+_schema_ready = False
 CATEGORIES = ("Аккаунты", "Подписки", "API доступ")
 SERVICES = ("ChatGPT", "Claude", "MiniMax", "DeepSeek", "Gemini", "Kimi")
 
@@ -26,10 +26,10 @@ app.config.update(
 
 
 def get_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required")
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE, timeout=10)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys = ON")
+        g.db = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
     return g.db
 
 
@@ -41,70 +41,60 @@ def close_db(_error=None):
 
 
 def now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc)
 
 
 def init_db():
+    global _schema_ready
+    if _schema_ready:
+        return
     db = get_db()
-    db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            password_hash TEXT NOT NULL,
-            balance INTEGER NOT NULL DEFAULT 50000 CHECK(balance >= 0),
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS listings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            seller_id INTEGER NOT NULL REFERENCES users(id),
-            title TEXT NOT NULL,
-            category TEXT NOT NULL,
-            service TEXT NOT NULL,
-            description TEXT NOT NULL,
-            price INTEGER NOT NULL CHECK(price > 0),
-            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','sold')),
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            listing_id INTEGER NOT NULL REFERENCES listings(id),
-            buyer_id INTEGER NOT NULL REFERENCES users(id),
-            seller_id INTEGER NOT NULL REFERENCES users(id),
-            amount INTEGER NOT NULL CHECK(amount > 0),
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status);
-        CREATE INDEX IF NOT EXISTS idx_orders_buyer ON orders(buyer_id);
-        CREATE INDEX IF NOT EXISTS idx_orders_seller ON orders(seller_id);
-    """)
-    if db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 0:
-        demo_hash = generate_password_hash(secrets.token_urlsafe(24))
-        cursor = db.execute(
-            "INSERT INTO users(username,email,password_hash,balance,created_at) VALUES(?,?,?,?,?)",
-            ("JetSeller", "demo@jetdeal.local", demo_hash, 150000, now()),
-        )
-        seller_id = cursor.lastrowid
-        items = [
-            ("ChatGPT Plus — 30 дней", "Подписки", "ChatGPT", "Персональная подписка на месяц. Передача и проверка согласуются с продавцом после покупки.", 1890),
-            ("Claude Pro — личный профиль", "Аккаунты", "Claude", "Активный профиль с подпиской Pro. Без корпоративной привязки.", 2490),
-            ("DeepSeek API — пакет доступа", "API доступ", "DeepSeek", "Лимит для тестовых и небольших production-задач. Детали согласуются после заказа.", 1290),
-            ("Gemini Advanced — 2 месяца", "Подписки", "Gemini", "Два месяца доступа, быстрый старт и поддержка продавца.", 3190),
-            ("MiniMax API — стартовый пакет", "API доступ", "MiniMax", "Доступ для прототипов, документация и помощь с начальной настройкой.", 990),
-            ("Kimi — готовый аккаунт", "Аккаунты", "Kimi", "Проверенный аккаунт для работы с длинным контекстом.", 790),
-        ]
-        db.executemany(
-            "INSERT INTO listings(seller_id,title,category,service,description,price,created_at) VALUES(?,?,?,?,?,?,?)",
-            [(seller_id, *item, now()) for item in items],
-        )
+    with db.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(%s)", (742031,))
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                username VARCHAR(30) NOT NULL,
+                email VARCHAR(120) NOT NULL,
+                password_hash TEXT NOT NULL,
+                balance BIGINT NOT NULL DEFAULT 50000 CHECK(balance >= 0),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_key ON users (LOWER(username));
+            CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_key ON users (LOWER(email));
+            CREATE TABLE IF NOT EXISTS listings (
+                id BIGSERIAL PRIMARY KEY,
+                seller_id BIGINT NOT NULL REFERENCES users(id),
+                title VARCHAR(80) NOT NULL,
+                category VARCHAR(30) NOT NULL,
+                service VARCHAR(30) NOT NULL,
+                description VARCHAR(1000) NOT NULL,
+                price BIGINT NOT NULL CHECK(price > 0),
+                status VARCHAR(10) NOT NULL DEFAULT 'active' CHECK(status IN ('active','sold')),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                id BIGSERIAL PRIMARY KEY,
+                listing_id BIGINT NOT NULL REFERENCES listings(id),
+                buyer_id BIGINT NOT NULL REFERENCES users(id),
+                seller_id BIGINT NOT NULL REFERENCES users(id),
+                amount BIGINT NOT NULL CHECK(amount > 0),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status);
+            CREATE INDEX IF NOT EXISTS idx_orders_buyer ON orders(buyer_id);
+            CREATE INDEX IF NOT EXISTS idx_orders_seller ON orders(seller_id);
+        """)
     db.commit()
+    _schema_ready = True
 
 
 @app.before_request
 def load_user_and_csrf():
+    init_db()
     g.user = None
     if session.get("user_id"):
-        g.user = get_db().execute("SELECT * FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+        g.user = get_db().execute("SELECT * FROM users WHERE id = %s", (session["user_id"],)).fetchone()
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_urlsafe(32)
     if request.method == "POST" and not secrets.compare_digest(request.form.get("csrf_token", ""), session["csrf_token"]):
@@ -145,7 +135,7 @@ BASE = r'''<!doctype html>
 {% with messages=get_flashed_messages(with_categories=true) %}{% if messages %}<div class="flash-wrap">{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}{% endwith %}
 <main>{{ content|safe }}</main>
 <footer><div class="container footer-inner"><span>© 2026 JetDeal. Независимый маркетплейс.</span><span>Не хранит пароли и API-ключи · Демо-баланс</span></div></footer>
-<script>setTimeout(()=>document.querySelector('.flash-wrap')?.remove(),4500)</script>
+<script>setTimeout(()=>document.querySelector('.flash-wrap')%s.remove(),4500)</script>
 </body></html>'''
 
 
@@ -166,11 +156,11 @@ def index():
     sql = "SELECT l.*,u.username FROM listings l JOIN users u ON u.id=l.seller_id WHERE l.status='active'"
     params = []
     if category in CATEGORIES:
-        sql += " AND l.category=?"; params.append(category)
+        sql += " AND l.category=%s"; params.append(category)
     if service in SERVICES:
-        sql += " AND l.service=?"; params.append(service)
+        sql += " AND l.service=%s"; params.append(service)
     if search:
-        sql += " AND (l.title LIKE ? OR l.description LIKE ?)"; params += [f"%{search}%", f"%{search}%"]
+        sql += " AND (l.title LIKE %s OR l.description LIKE %s)"; params += [f"%{search}%", f"%{search}%"]
     order = {"cheap":"l.price ASC", "expensive":"l.price DESC", "new":"l.id DESC"}.get(sort, "l.id DESC")
     items = get_db().execute(sql + " ORDER BY " + order, params).fetchall()
     cards = "".join(render_template_string(CARD, item=item) for item in items)
@@ -196,11 +186,12 @@ def register():
         if error: flash(error, "warning")
         else:
             try:
-                cursor = get_db().execute("INSERT INTO users(username,email,password_hash,balance,created_at) VALUES(?,?,?,?,?)", (username,email,generate_password_hash(password),50000,now()))
-                get_db().commit(); session.clear(); session["user_id"] = cursor.lastrowid
+                row = get_db().execute("INSERT INTO users(username,email,password_hash,balance,created_at) VALUES(%s,%s,%s,%s,%s) RETURNING id", (username,email,generate_password_hash(password),50000,now())).fetchone()
+                get_db().commit(); session.clear(); session["user_id"] = row["id"]
                 flash("Аккаунт создан. На баланс начислено 50 000 ₽ для демо-покупок.", "success")
                 return redirect(url_for("dashboard"))
-            except sqlite3.IntegrityError: flash("Имя или email уже используются.", "warning")
+            except psycopg.IntegrityError:
+                get_db().rollback(); flash("Имя или email уже используются.", "warning")
     return page("Регистрация", FORM_AUTH, heading="Создать аккаунт", lead="Получите 50 000 ₽ демо-баланса и протестируйте JetDeal.", action="Регистрация", register=True)
 
 
@@ -209,7 +200,7 @@ def login():
     if g.user: return redirect(url_for("dashboard"))
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower(); password = request.form.get("password", "")
-        user = get_db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        user = get_db().execute("SELECT * FROM users WHERE email=%s", (email,)).fetchone()
         if user and check_password_hash(user["password_hash"], password):
             session.clear(); session["user_id"] = user["id"]
             flash("С возвращением!", "success")
@@ -229,7 +220,7 @@ def logout():
 
 @app.route("/listing/<int:listing_id>")
 def listing_detail(listing_id):
-    item = get_db().execute("SELECT l.*,u.username FROM listings l JOIN users u ON u.id=l.seller_id WHERE l.id=?", (listing_id,)).fetchone()
+    item = get_db().execute("SELECT l.*,u.username FROM listings l JOIN users u ON u.id=l.seller_id WHERE l.id=%s", (listing_id,)).fetchone()
     if item is None: abort(404)
     template = '''<section class="container detail"><div class="panel"><span class="eyebrow">{{ item.service }} · {{ item.category }}</span><h1>{{ item.title }}</h1><p class="detail-copy">{{ item.description }}</p><div class="notice">JetDeal не хранит логины, пароли и API-ключи. После заказа договоритесь с продавцом о безопасной передаче доступа вне платформы.</div></div><aside class="panel buybox"><span class="tag">{{ 'В продаже' if item.status=='active' else 'Продано' }}</span><span class="price">{{ item.price|money }}</span><div class="meta"><div><span>Продавец</span><b>{{ item.username }}</b></div><div><span>Категория</span><b>{{ item.category }}</b></div><div><span>Сервис</span><b>{{ item.service }}</b></div></div>{% if item.status=='active' and (not g.user or g.user.id != item.seller_id) %}<form method="post" action="{{ url_for('buy', listing_id=item.id) }}"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="btn btn-primary btn-block">Купить за {{ item.price|money }}</button></form>{% elif g.user and g.user.id == item.seller_id %}<div class="notice">Это ваше объявление.</div>{% else %}<button class="btn btn-block" disabled>Предложение продано</button>{% endif %}</aside></section>'''
     return page(item["title"], template, item=item)
@@ -249,8 +240,8 @@ def sell():
         elif not (50 <= price <= 1_000_000): error="Цена должна быть от 50 до 1 000 000 ₽."
         if error: flash(error,"warning")
         else:
-            cursor=get_db().execute("INSERT INTO listings(seller_id,title,category,service,description,price,created_at) VALUES(?,?,?,?,?,?,?)",(g.user["id"],title,category,service,description,price,now())); get_db().commit()
-            flash("Объявление опубликовано.","success"); return redirect(url_for("listing_detail",listing_id=cursor.lastrowid))
+            row=get_db().execute("INSERT INTO listings(seller_id,title,category,service,description,price,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id",(g.user["id"],title,category,service,description,price,now())).fetchone(); get_db().commit()
+            flash("Объявление опубликовано.","success"); return redirect(url_for("listing_detail",listing_id=row["id"]))
     template='''<section class="container"><div class="panel form-card"><h1>Новое объявление</h1><p>Опишите предложение, но не указывайте логины, пароли и ключи доступа.</p><form class="form-grid" method="post"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><div class="field"><label>Название</label><input class="input" name="title" maxlength="80" required placeholder="Например, ChatGPT Plus на 30 дней"></div><div class="field"><label>Категория</label><select class="input" name="category" required>{% for v in categories %}<option>{{ v }}</option>{% endfor %}</select></div><div class="field"><label>Нейросеть</label><select class="input" name="service" required>{% for v in services %}<option>{{ v }}</option>{% endfor %}</select></div><div class="field"><label>Описание</label><textarea class="input" name="description" minlength="20" maxlength="1000" required placeholder="Срок доступа, формат передачи, особенности предложения"></textarea><span class="hint">Никогда не публикуйте секретные данные.</span></div><div class="field"><label>Цена, ₽</label><input class="input" type="number" name="price" min="50" max="1000000" required></div><button class="btn btn-primary">Опубликовать</button></form></div></section>'''
     return page("Продать",template,categories=CATEGORIES,services=SERVICES)
 
@@ -260,17 +251,16 @@ def sell():
 def buy(listing_id):
     db=get_db()
     try:
-        db.execute("BEGIN IMMEDIATE")
-        item=db.execute("SELECT * FROM listings WHERE id=?",(listing_id,)).fetchone()
-        buyer=db.execute("SELECT * FROM users WHERE id=?",(g.user["id"],)).fetchone()
+        item=db.execute("SELECT * FROM listings WHERE id=%s FOR UPDATE",(listing_id,)).fetchone()
+        buyer=db.execute("SELECT * FROM users WHERE id=%s FOR UPDATE",(g.user["id"],)).fetchone()
         if item is None or item["status"]!="active": raise ValueError("Предложение уже недоступно.")
         if item["seller_id"]==buyer["id"]: raise ValueError("Нельзя купить собственное объявление.")
         if buyer["balance"]<item["price"]: raise ValueError("Недостаточно средств на демо-балансе.")
-        changed=db.execute("UPDATE listings SET status='sold' WHERE id=? AND status='active'",(listing_id,)).rowcount
+        changed=db.execute("UPDATE listings SET status='sold' WHERE id=%s AND status='active'",(listing_id,)).rowcount
         if changed != 1: raise ValueError("Предложение уже купил другой пользователь.")
-        db.execute("UPDATE users SET balance=balance-? WHERE id=?",(item["price"],buyer["id"]))
-        db.execute("UPDATE users SET balance=balance+? WHERE id=?",(item["price"],item["seller_id"]))
-        db.execute("INSERT INTO orders(listing_id,buyer_id,seller_id,amount,created_at) VALUES(?,?,?,?,?)",(listing_id,buyer["id"],item["seller_id"],item["price"],now()))
+        db.execute("UPDATE users SET balance=balance-%s WHERE id=%s",(item["price"],buyer["id"]))
+        db.execute("UPDATE users SET balance=balance+%s WHERE id=%s",(item["price"],item["seller_id"]))
+        db.execute("INSERT INTO orders(listing_id,buyer_id,seller_id,amount,created_at) VALUES(%s,%s,%s,%s,%s)",(listing_id,buyer["id"],item["seller_id"],item["price"],now()))
         db.commit(); flash("Покупка оформлена. Согласуйте передачу доступа с продавцом вне JetDeal.","success")
     except ValueError as error:
         db.rollback(); flash(str(error),"warning")
@@ -281,9 +271,9 @@ def buy(listing_id):
 @login_required
 def dashboard():
     db=get_db(); uid=g.user["id"]
-    listings=db.execute("SELECT * FROM listings WHERE seller_id=? ORDER BY id DESC",(uid,)).fetchall()
-    purchases=db.execute("SELECT o.*,l.title,u.username FROM orders o JOIN listings l ON l.id=o.listing_id JOIN users u ON u.id=o.seller_id WHERE o.buyer_id=? ORDER BY o.id DESC",(uid,)).fetchall()
-    sales=db.execute("SELECT o.*,l.title,u.username FROM orders o JOIN listings l ON l.id=o.listing_id JOIN users u ON u.id=o.buyer_id WHERE o.seller_id=? ORDER BY o.id DESC",(uid,)).fetchall()
+    listings=db.execute("SELECT * FROM listings WHERE seller_id=%s ORDER BY id DESC",(uid,)).fetchall()
+    purchases=db.execute("SELECT o.*,l.title,u.username FROM orders o JOIN listings l ON l.id=o.listing_id JOIN users u ON u.id=o.seller_id WHERE o.buyer_id=%s ORDER BY o.id DESC",(uid,)).fetchall()
+    sales=db.execute("SELECT o.*,l.title,u.username FROM orders o JOIN listings l ON l.id=o.listing_id JOIN users u ON u.id=o.buyer_id WHERE o.seller_id=%s ORDER BY o.id DESC",(uid,)).fetchall()
     template='''<section class="section"><div class="container"><div class="section-head"><div><span class="eyebrow">Личный кабинет</span><h2>Здравствуйте, {{ g.user.username }}</h2></div><a class="btn btn-primary" href="{{ url_for('sell') }}">Новое объявление</a></div><div class="stats"><div class="stat"><strong>{{ g.user.balance|money }}</strong><span>Демо-баланс</span></div><div class="stat"><strong>{{ listings|length }}</strong><span>Мои объявления</span></div><div class="stat"><strong>{{ purchases|length }}</strong><span>Покупки</span></div></div><div class="section-head"><h2>Мои объявления</h2></div><div class="table-list">{% for x in listings %}<a class="row" href="{{ url_for('listing_detail',listing_id=x.id) }}"><div><b>{{ x.title }}</b><p>{{ x.service }} · {{ 'В продаже' if x.status=='active' else 'Продано' }}</p></div><strong>{{ x.price|money }}</strong></a>{% else %}<div class="empty">Вы ещё ничего не продаёте.</div>{% endfor %}</div><div class="section-head" style="margin-top:42px"><h2>Покупки</h2></div><div class="table-list">{% for x in purchases %}<div class="row"><div><b>{{ x.title }}</b><p>Продавец: {{ x.username }}. Передача доступа согласуется вне JetDeal.</p></div><strong>{{ x.amount|money }}</strong></div>{% else %}<div class="empty">Покупок пока нет.</div>{% endfor %}</div><div class="section-head" style="margin-top:42px"><h2>Продажи</h2></div><div class="table-list">{% for x in sales %}<div class="row"><div><b>{{ x.title }}</b><p>Покупатель: {{ x.username }}</p></div><strong>{{ x.amount|money }}</strong></div>{% else %}<div class="empty">Продаж пока нет.</div>{% endfor %}</div></div></section>'''
     return page("Личный кабинет",template,listings=listings,purchases=purchases,sales=sales)
 
@@ -292,9 +282,6 @@ def dashboard():
 def not_found(_error):
     return page("Не найдено",'<section class="container"><div class="panel form-card"><h1>Страница не найдена</h1><p>Проверьте адрес или вернитесь в каталог.</p><a class="btn btn-primary" href="{{ url_for(\'index\') }}">В каталог</a></div></section>'),404
 
-
-with app.app_context():
-    init_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
